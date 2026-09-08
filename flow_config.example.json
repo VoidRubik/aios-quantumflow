@@ -1,0 +1,7 @@
+{
+  "style": "formal",
+  "dictionary": ["Wispr Flow", "QuantumFlow", "Ollama", "Claude", "hotkey"],
+  "snippets": {
+    "my email": "you@example.com"
+  }
+}

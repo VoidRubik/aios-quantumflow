@@ -1,0 +1,9 @@
+node_modules/
+__pycache__/
+*.log
+.venv/
+
+# local, per-user — generated or holds personal data. Never commit.
+flow_config.json
+flow_stats.json
+dashboard.html

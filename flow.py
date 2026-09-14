@@ -183,15 +183,20 @@ def fast_clean(text):
     return t[:1].upper() + t[1:] if t else ""
 
 
-# calibration knob, measured 2026-09-13: real near-misses ("whisper flow"->
-# "wispr flow", "olama"->"Ollama") cluster 0.91-0.95; unrelated text clusters
-# 0.24-0.54 — even "quantum physics" vs "QuantumFlow" only hits 0.54. 0.80
-# sits in the gap. NOTE: this catches spelling-level near-misses only. It does
-# NOT catch "content flow" (the original complaint) — that's a phonetic
-# confusion character-diffing can't see (ratio 0.52). hotwords= is the only
-# lever for that; a stubborn one can be added as a literal snippet instead
-# (flow_config.json snippets: "content flow" -> "QuantumFlow").
-SNAP_VOCAB_CUTOFF = 0.80
+# calibration knob, re-measured 2026-09-13 after adversarial review found
+# 0.80 corrupts real words ("hockey" -> "hotkey", ratio 0.833). At the
+# window's ACTUAL granularity — single transcript word vs a single-word term
+# like "hotkey"/"Claude"/"Ollama" — a genuine near-miss ("whisper" vs "wispr",
+# 0.833) ties EXACTLY with that false positive. No cutoff separates them; a
+# single-word dictionary term's near-miss is caught at the phrase level
+# instead ("whisper flow" vs "Wispr Flow" = 0.909, still well above 0.90).
+# 0.90 clears both single-word false positives (0.833) while keeping every
+# multi-word near-miss measured (0.909-0.947). Still does NOT catch "content
+# flow" (the original complaint) — that's a phonetic confusion character-
+# diffing can't see (ratio 0.52). hotwords= is the lever for that; a stubborn
+# one can be added as a literal snippet instead (flow_config.json snippets:
+# "content flow" -> "QuantumFlow").
+SNAP_VOCAB_CUTOFF = 0.90
 
 
 def snap_vocab(t):
@@ -203,7 +208,8 @@ def snap_vocab(t):
     for term in config["dictionary"]:
         tw = term.split()
         n = len(tw)
-        for i in range(len(words) - n + 1):
+        i = 0
+        while i <= len(words) - n:
             span = " ".join(words[i:i + n])
             trail = ""
             core = span
@@ -211,9 +217,14 @@ def snap_vocab(t):
                 trail = core[-1] + trail
                 core = core[:-1]
             if core.lower() == term.lower():
+                i += n
                 continue
             if difflib.SequenceMatcher(None, core.lower(), term.lower()).ratio() >= SNAP_VOCAB_CUTOFF:
                 words[i:i + n] = (term + trail).split()
+                i += n   # skip past the replacement — don't let the next
+                         # window straddle half of it (adversarial finding #2)
+            else:
+                i += 1
     return " ".join(words)
 
 
@@ -229,7 +240,12 @@ def apply_style(t):
     if s == "casual":
         return t.rstrip(".")
     if s == "very_casual":
-        return t.lower().replace(",", "").rstrip(".")
+        # lowercase everything except dictionary terms snap_vocab just fixed
+        # the casing of (adversarial review finding #5 — very_casual used to
+        # silently undo it, e.g. "QuantumFlow" -> "quantumflow")
+        words = t.rstrip(".").replace(",", "").split()
+        keep = {w.lower(): w for term in config["dictionary"] for w in term.split()}
+        return " ".join(keep.get(w.lower(), w.lower()) for w in words)
     return t
 
 
@@ -526,6 +542,9 @@ def ui(fn, *args):
 frames = []
 stream = None
 recording = False
+transcribing = False    # True from stop_recording until finish() completes —
+                         # blocks a new take from starting mid-transcribe and
+                         # racing its pill/state updates (adversarial finding #3)
 mic_level = 0.0          # live amplitude for the waveform
 lock = threading.Lock()
 
@@ -538,6 +557,9 @@ def _on_audio(data, *_):
 
 def start_recording():
     global stream, recording, frames
+    with lock:
+        if recording or transcribing:
+            return
     ui(pill.recording)   # instant feedback, before mic opens
     with lock:
         if recording:
@@ -597,6 +619,8 @@ def stop_recording():
         return
     if SAVE_AUDIO:
         save_sample(a)
+    global transcribing
+    transcribing = True
     ui(pill.busy, "Transcribing…")
     threading.Thread(target=finish, args=(a,), daemon=True).start()
 
@@ -615,9 +639,11 @@ def cancel_recording():
 
 
 def detect_lang(audio):
-    """Detect once, on the FULL recording (not a 4s slice), clamped to the
-    user's two languages — a bilingual EN/ES speaker confuses Whisper's LID
-    head far less over 30s+ of audio than over the first few seconds."""
+    """Detect once, over the first ~60s (language_detection_segments=2 x a
+    30s window — not the true full recording on 60s+ takes, adversarial
+    review finding #6), clamped to the user's two languages. Still a large
+    win over the old ~4s-chunk detection for this app's typical 5-15s
+    dictations."""
     try:
         lang, prob, allp = model.detect_language(
             audio, language_detection_segments=2,
@@ -634,6 +660,7 @@ def detect_lang(audio):
 
 def finish(audio):
     """One full-audio pass: transcribe, clean, expand snippets, style, paste."""
+    global transcribing
     try:
         seconds = len(audio) / SAMPLE_RATE
         load_config()   # BEFORE transcribe — hotwords must see today's edits
@@ -666,6 +693,8 @@ def finish(audio):
     except Exception:
         log.exception("pipeline failed")
         ui(pill.flash, "⚠ Error — see flow.log")
+    finally:
+        transcribing = False
 
 
 def transcribe(audio, language):

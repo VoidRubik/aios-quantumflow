@@ -66,12 +66,17 @@ def load_samples():
 # (label, model_size, transcribe_kwargs) — condition_on_previous_text and
 # hotwords are what the one-pass rewrite depends on; vad_filter on/off and
 # beam_size are the open questions this bench exists to close.
+# temperature matches flow.py's transcribe() exactly (adversarial review
+# finding #4: bench used to omit it, so every run silently used the library
+# default [0,.2,.4,.6,.8,1.0] instead of production's truncated ladder —
+# the cited WER/wall numbers didn't strictly correspond to what ships).
+TEMP = [0.0, 0.2, 0.4, 0.6]
 CONFIGS = [
-    ("base b1 novad hot",      "base",  dict(beam_size=1, vad_filter=False, hotwords=HOTWORDS, condition_on_previous_text=True)),
-    ("base b5 novad hot",      "base",  dict(beam_size=5, vad_filter=False, hotwords=HOTWORDS, condition_on_previous_text=True)),
-    ("base b5 vad hot",        "base",  dict(beam_size=5, vad_filter=True,  hotwords=HOTWORDS, condition_on_previous_text=True)),
-    ("base b5 novad noprompt", "base",  dict(beam_size=5, vad_filter=False, condition_on_previous_text=True)),
-    ("small b1 novad hot",     "small", dict(beam_size=1, vad_filter=False, hotwords=HOTWORDS, condition_on_previous_text=True)),
+    ("base b1 novad hot",      "base",  dict(beam_size=1, vad_filter=False, hotwords=HOTWORDS, condition_on_previous_text=True, temperature=TEMP)),
+    ("base b5 novad hot",      "base",  dict(beam_size=5, vad_filter=False, hotwords=HOTWORDS, condition_on_previous_text=True, temperature=TEMP)),
+    ("base b5 vad hot",        "base",  dict(beam_size=5, vad_filter=True,  hotwords=HOTWORDS, condition_on_previous_text=True, temperature=TEMP)),
+    ("base b5 novad noprompt", "base",  dict(beam_size=5, vad_filter=False, condition_on_previous_text=True, temperature=TEMP)),
+    ("small b1 novad hot",     "small", dict(beam_size=1, vad_filter=False, hotwords=HOTWORDS, condition_on_previous_text=True, temperature=TEMP)),
 ]
 
 

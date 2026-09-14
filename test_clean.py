@@ -46,7 +46,7 @@ check("stutter collapse", fast_clean("the the cat cat sat"), "The cat sat")
 check("only punctuation", fast_clean("...!?"), "")
 check("empty", fast_clean(""), "")
 
-# --- snap_vocab: spelling-level near-misses, measured cutoff 0.80 ---
+# --- snap_vocab: spelling-level near-misses, measured cutoff 0.90 ---
 # NOT the flagship "content flow"->"QuantumFlow" case — that's a phonetic
 # confusion (ratio 0.52), not a spelling near-miss; character-diffing can't
 # see it. hotwords= is the real lever there. Documented, not silently missed.
@@ -64,12 +64,33 @@ check("content flow untouched (known miss, see cutoff comment in flow.py)",
 check("ordinary sentence untouched",
       snap_vocab("the cat sat on the mat"),
       "the cat sat on the mat")
+# adversarial-review finding #1: 0.80 corrupted this ordinary word (0.833,
+# an exact tie with "whisper"->"wispr"'s real near-miss at the same
+# single-word granularity — no cutoff separates them at n=1, so single-word
+# terms must be caught at 0.90+, same as multi-word terms).
+check("hockey untouched (adversarial finding #1)",
+      snap_vocab("I love watching hockey on weekends"),
+      "I love watching hockey on weekends")
+# adversarial-review finding #2: window used to advance by 1 after a snap,
+# so a 2-word replacement's tail word ("Flow") could straddle into the next
+# window with the following original word and spuriously re-match. Back-to-
+# back occurrences of the same 2-word term exercise the skip-ahead fix.
+check("consecutive matches don't straddle (adversarial finding #2)",
+      snap_vocab("whisper flow whisper flow crashed twice"),
+      "Wispr Flow Wispr Flow crashed twice")
 
 # --- apply_snippets / apply_style: unchanged behavior, still exercised ---
 check("snippet expands", apply_snippets("send my email please"),
       "send you@example.com please")
-check("very_casual strips commas+periods+caps", apply_style("Hi, Bruno."), "Hi, Bruno.")
+check("formal style is a no-op", apply_style("Hi, Bruno."), "Hi, Bruno.")
 ns["config"]["style"] = "very_casual"
-check("very_casual applies", apply_style("Hi, Bruno."), "hi bruno")
+check("very_casual lowercases", apply_style("Hi, Bruno."), "hi bruno")
+# adversarial-review finding #5: very_casual used to silently undo
+# snap_vocab's casing fix ("QuantumFlow" -> "quantumflow"). Dictionary
+# terms must survive very_casual with their casing intact.
+check("very_casual preserves dictionary casing (adversarial finding #5)",
+      apply_style("I use QuantumFlow and Wispr Flow daily."),
+      "i use QuantumFlow and Wispr Flow daily")
+ns["config"]["style"] = "formal"
 
 print(f"{n_ok} checks passed")

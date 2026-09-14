@@ -25,12 +25,15 @@ USAGE
 - flow_config.json holds your style, custom dictionary words (helps Whisper
   recognize them) and snippets (say "my email" -> your address is pasted).
 
-Long recordings are transcribed live in 8s chunks while you speak, so the
-wait after you stop stays short no matter how long you talked.
+You speak, then release/tap to stop — the whole recording is transcribed in
+one pass (not live chunks; that design lost cross-sentence context and caused
+seam artifacts — see git history for the 2026-09 rewrite). Typical 5-15s
+dictations paste in ~5-8s; a 60s+ monologue will take proportionally longer.
 """
 
 import ctypes
 from ctypes import wintypes
+import difflib
 import json
 import logging
 import math
@@ -41,6 +44,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import wave
 import webbrowser
 from collections import Counter
 from datetime import date, datetime, timedelta
@@ -71,16 +75,20 @@ HOTKEY_MODS = 0              # e.g. 0x0002 = Ctrl, 0x0008 = Win, addable
 HOTKEY_NAME = "F9"
 HOLD_THRESHOLD = 0.4         # held longer than this = hold-to-talk
 DOUBLE_TAP_WINDOW = 0.4      # two taps within this = latch on
-# benchmarked 2026-07-03: base = 3.3x faster than small on this CPU, keeps up
-# with live speech (2.2s post-stop wait vs 16s); ES quality held. Revert to
-# "small" here if accuracy ever bothers you more than speed.
+# benchmarked 2026-09-13 (bench.py, one-pass rewrite): base+beam5 fits the
+# budget (5.1s clip -> 7.1s wall, 0% WER) and beats small (65s clip: base
+# 30.1s vs small 42.0s, small's better WER isn't worth 40% more wait). Revert
+# only if you have a faster CPU and want small's accuracy.
 WHISPER_MODEL = "base"
 # llama3.2:1b refuses/hallucinates on cleanup — qwen2.5:1.5b same size, reliable
 OLLAMA_MODEL = "qwen2.5:1.5b"
 OLLAMA_URL = "http://localhost:11434/api/chat"
 SAMPLE_RATE = 16000
 MIN_AUDIO_SECONDS = 0.5      # ignore accidental blips
-CHUNK_SECONDS = 5            # live chunk; base transcribes 5s in ~1.6s (keeps up)
+# ponytail: bench-only flag, dumps every recording to samples/ for bench.py.
+# Off by default — this repo is public, samples/ is gitignored, never ship True.
+SAVE_AUDIO = False
+SAMPLES_DIR = os.path.join(_BASE, "samples")
 
 # Cleanup: "fast" = instant local regex (default — the LLM takes 30-60s on
 # this CPU for barely better output). "llm" = deep clean via Ollama.
@@ -173,6 +181,40 @@ def fast_clean(text):
     t = re.sub(r"\s{2,}", " ", t).strip(" ,")
     t = re.sub(r"^[.!?;:\s]+$", "", t)   # only punctuation left = nothing said
     return t[:1].upper() + t[1:] if t else ""
+
+
+# calibration knob, measured 2026-09-13: real near-misses ("whisper flow"->
+# "wispr flow", "olama"->"Ollama") cluster 0.91-0.95; unrelated text clusters
+# 0.24-0.54 — even "quantum physics" vs "QuantumFlow" only hits 0.54. 0.80
+# sits in the gap. NOTE: this catches spelling-level near-misses only. It does
+# NOT catch "content flow" (the original complaint) — that's a phonetic
+# confusion character-diffing can't see (ratio 0.52). hotwords= is the only
+# lever for that; a stubborn one can be added as a literal snippet instead
+# (flow_config.json snippets: "content flow" -> "QuantumFlow").
+SNAP_VOCAB_CUTOFF = 0.80
+
+
+def snap_vocab(t):
+    """hotwords biases the decoder but doesn't guarantee proper nouns land —
+    "QuantumFlow" still came out "content flow" with hotwords active. This
+    deterministically repairs it: slide each dictionary term's word-count
+    window over the text, snap a close-enough span to the exact term."""
+    words = t.split()
+    for term in config["dictionary"]:
+        tw = term.split()
+        n = len(tw)
+        for i in range(len(words) - n + 1):
+            span = " ".join(words[i:i + n])
+            trail = ""
+            core = span
+            while core and core[-1] in ".,!?;:":
+                trail = core[-1] + trail
+                core = core[:-1]
+            if core.lower() == term.lower():
+                continue
+            if difflib.SequenceMatcher(None, core.lower(), term.lower()).ratio() >= SNAP_VOCAB_CUTOFF:
+                words[i:i + n] = (term + trail).split()
+    return " ".join(words)
 
 
 def apply_snippets(t):
@@ -480,13 +522,12 @@ def ui(fn, *args):
     root.after(0, fn, *args)
 
 
-# ---- recording + live chunked transcription ------------------------------------
+# ---- recording + one-pass transcription -----------------------------------------
 frames = []
 stream = None
 recording = False
 mic_level = 0.0          # live amplitude for the waveform
 lock = threading.Lock()
-session = None
 
 
 def _on_audio(data, *_):
@@ -495,77 +536,8 @@ def _on_audio(data, *_):
     mic_level = float(np.abs(data).mean())
 
 
-def quiet_cut(a):
-    """Index of the quietest 30ms in the last 1.5s — cut chunks there,
-    never mid-word."""
-    tail = a[-int(1.5 * SAMPLE_RATE):]
-    w = 480
-    if len(tail) <= w:
-        return len(a)
-    rms = np.convolve(np.abs(tail), np.ones(w) / w, "valid")
-    return len(a) - len(tail) + int(np.argmin(rms)) + w // 2
-
-
-class Chunker(threading.Thread):
-    """Transcribes 8s chunks while recording continues, so the wait after
-    stop is only the tail chunk — Wispr-style fluency on a CPU."""
-
-    def __init__(self):
-        super().__init__(daemon=True)
-        self.parts = []
-        self.lang = None
-        self.done = 0
-        self.cancelled = False
-
-    def _snapshot(self):
-        with lock:
-            if not frames:
-                return np.empty(0, np.float32)
-            return np.concatenate(frames)[:, 0]
-
-    def _eat(self, audio):
-        t0 = time.time()
-        try:
-            segments, info = transcribe(audio, self.lang)
-            text = " ".join(s.text.strip() for s in segments).strip()
-        except Exception:
-            log.exception("chunk transcribe failed")
-            text = ""
-            info = None
-        if self.cancelled:
-            return
-        if self.lang is None and info is not None:
-            self.lang = info.language
-        if text:
-            self.parts.append(text)
-        self.done += len(audio)
-        log.info("chunk %.1fs -> %.1fs (%d parts)",
-                 len(audio) / SAMPLE_RATE, time.time() - t0, len(self.parts))
-
-    def run(self):
-        chunk = SAMPLE_RATE * CHUNK_SECONDS
-        while not self.cancelled:
-            a = self._snapshot()
-            with lock:
-                rec = recording
-            un = len(a) - self.done
-            if rec and un >= chunk:
-                seg = a[self.done:self.done + chunk]
-                cut = quiet_cut(seg)
-                self._eat(a[self.done:self.done + cut])
-            elif not rec:
-                if un > 0:
-                    self._eat(a[self.done:])
-                return
-            else:
-                time.sleep(0.15)
-
-    def text(self):
-        return " ".join(self.parts).strip()
-
-
 def start_recording():
-    global stream, recording, frames, session
+    global stream, recording, frames
     ui(pill.recording)   # instant feedback, before mic opens
     with lock:
         if recording:
@@ -577,8 +549,6 @@ def start_recording():
         )
         stream.start()
         recording = True
-    session = Chunker()
-    session.start()   # live-transcribes chunks while we keep recording
     log.info("recording started")
 
 
@@ -595,6 +565,21 @@ def _close_stream():
         return sum(len(f) for f in frames)
 
 
+def save_sample(a):
+    """Bench-only: dump one recording as a wav under samples/. See SAVE_AUDIO."""
+    try:
+        os.makedirs(SAMPLES_DIR, exist_ok=True)
+        path = os.path.join(SAMPLES_DIR, f"rec_{int(time.time())}.wav")
+        with wave.open(path, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(SAMPLE_RATE)
+            w.writeframes((np.clip(a, -1, 1) * 32767).astype("<i2").tobytes())
+        log.info("sample saved: %s (write ground truth in a matching .txt)", path)
+    except Exception:
+        log.exception("save_sample failed")
+
+
 def stop_recording():
     n = _close_stream()
     if n is None:
@@ -605,41 +590,64 @@ def stop_recording():
         rms = float(np.sqrt(np.mean(a ** 2)))
     log.info("recording stopped (%.1fs, rms %.4f)", n / SAMPLE_RATE, rms)
     if n < SAMPLE_RATE * MIN_AUDIO_SECONDS:
-        session.cancelled = True
         ui(pill.idle)
         return
     if rms < 0.0015:   # near-silence -> Whisper hallucinates ("Thank you.")
-        session.cancelled = True
         ui(pill.flash, "⚠ Mic silent — check input device")
         return
+    if SAVE_AUDIO:
+        save_sample(a)
     ui(pill.busy, "Transcribing…")
-    threading.Thread(target=finish, args=(session, n / SAMPLE_RATE),
-                     daemon=True).start()
+    threading.Thread(target=finish, args=(a,), daemon=True).start()
 
 
 def cancel_recording():
+    # ponytail: no mid-transcription cancel — the ✕ button only exists while
+    # pill.state == "recording" (see Pill._click), and stop_recording flips
+    # state to "busy" before finish() ever starts, so this path was never
+    # reachable during a transcribe() call, one-pass or chunked. Add a
+    # generation counter here if that UI gate ever changes.
     global latched
     latched = False
-    if session is not None:
-        session.cancelled = True
     if _close_stream() is not None:
         log.info("recording cancelled")
     ui(pill.idle)
 
 
-def finish(sess, seconds):
-    """Assemble chunks, clean, expand snippets, apply style, paste, count."""
+def detect_lang(audio):
+    """Detect once, on the FULL recording (not a 4s slice), clamped to the
+    user's two languages — a bilingual EN/ES speaker confuses Whisper's LID
+    head far less over 30s+ of audio than over the first few seconds."""
     try:
-        sess.join(timeout=300)
-        if sess.cancelled:
-            return
-        raw = sess.text()
+        lang, prob, allp = model.detect_language(
+            audio, language_detection_segments=2,
+            language_detection_threshold=0.5)
+    except Exception:
+        log.exception("detect_language failed")
+        return "en"
+    if lang not in ("en", "es"):
+        probs = dict(allp)
+        lang = "en" if probs.get("en", 0.0) >= probs.get("es", 0.0) else "es"
+    log.info("lang %s (%.2f)", lang, prob)
+    return lang
+
+
+def finish(audio):
+    """One full-audio pass: transcribe, clean, expand snippets, style, paste."""
+    try:
+        seconds = len(audio) / SAMPLE_RATE
+        load_config()   # BEFORE transcribe — hotwords must see today's edits
+        lang = detect_lang(audio)
+        segments, info = transcribe(audio, lang)
+        parts = []
+        for s in segments:
+            parts.append(s.text.strip())
+            ui(pill.busy, f"Transcribing… {min(99, int(100 * s.end / seconds))}%")
+        raw = " ".join(p for p in parts if p).strip()
         if not raw:
             ui(pill.flash, "Nothing heard")
             return
-        lang = sess.lang or "en"
         log.info("(%s) %s", lang, raw)
-        load_config()
         fillers = [m.group(1) for m in STRIP_RE.finditer(raw)]
         text = fast_clean(raw)
         if not text:
@@ -650,7 +658,7 @@ def finish(sess, seconds):
             ui(pill.busy, "Cleaning…")
             text, ok = clean(text, lang)
         fixed = text != raw   # before style/snippets — those aren't fixes
-        text = apply_style(apply_snippets(text))
+        text = apply_style(apply_snippets(snap_vocab(text)))
         app = paste(text)
         stats.add(text, lang, seconds, fixed=fixed, app=app,
                   fillers=fillers)
@@ -660,16 +668,16 @@ def finish(sess, seconds):
         ui(pill.flash, "⚠ Error — see flow.log")
 
 
-def transcribe(audio, language=None):
-    kwargs = dict(vad_filter=True, beam_size=1,
-                  condition_on_previous_text=False,
-                  initial_prompt=vocab_hint(), language=language)
-    if batched is not None and len(audio) > SAMPLE_RATE * 12:
-        try:   # batched = 2-4x faster on long audio, same model/accuracy
-            return batched.transcribe(audio, batch_size=4, **kwargs)
-        except TypeError:
-            pass
-    return model.transcribe(audio, **kwargs)
+def transcribe(audio, language):
+    # base+beam5+novad+hotwords, measured 2026-09-13 (bench.py, samples/):
+    # 5s clean take 0% WER @ 7.1s wall; VAD on cost 3.6x more wall for no WER
+    # gain on pause-heavy speech. condition_on_previous_text=True is the
+    # whole point of one-pass — it's what carries context across Whisper's
+    # internal 30s windows (verified in faster_whisper's own source).
+    return model.transcribe(
+        audio, language=language, beam_size=5, vad_filter=False,
+        condition_on_previous_text=True, hotwords=vocab_hint(),
+        temperature=[0.0, 0.2, 0.4, 0.6])
 
 
 def paste(text):
@@ -1120,12 +1128,15 @@ threading.Thread(target=tray.run, daemon=True).start()
 
 # ---- startup ---------------------------------------------------------------------
 model = None
-batched = None
 
 
 def boot():
-    global model, batched
-    from faster_whisper import WhisperModel, BatchedInferencePipeline
+    global model
+    # NOTE: BatchedInferencePipeline deliberately not used — verified in
+    # faster-whisper 1.2.1 source (transcribe.py) that it hardcodes
+    # condition_on_previous_text=False regardless of what's passed, which
+    # would silently destroy the cross-window context one-pass exists for.
+    from faster_whisper import WhisperModel
     try:
         dev = sd.query_devices(sd.default.device[0])
         log.info("mic: %s", dev["name"])
@@ -1135,10 +1146,6 @@ def boot():
     ui(pill.busy, "Loading model…")
     model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8",
                          cpu_threads=os.cpu_count() or 4)
-    try:
-        batched = BatchedInferencePipeline(model)
-    except Exception as e:
-        log.warning("batched pipeline unavailable: %s", e)
     threading.Thread(target=hotkey_loop, daemon=True).start()
     try:
         mouse.on_button(on_middle_down, buttons=(mouse.MIDDLE,), types=("down",))
@@ -1148,7 +1155,7 @@ def boot():
 
     def warm():
         try:
-            list(model.transcribe(np.zeros(SAMPLE_RATE // 2, np.float32))[0])
+            list(transcribe(np.zeros(SAMPLE_RATE // 2, np.float32), "en")[0])
             if CLEANUP_MODE == "llm":
                 requests.post(OLLAMA_URL, json={
                     "model": OLLAMA_MODEL,

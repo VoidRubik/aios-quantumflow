@@ -7,3 +7,8 @@ __pycache__/
 flow_config.json
 flow_stats.json
 dashboard.html
+
+# voice recordings — never commit, this repo is public
+samples/
+*.wav
+flow_console.out
